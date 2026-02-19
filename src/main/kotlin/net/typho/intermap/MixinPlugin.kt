@@ -82,6 +82,10 @@ class MixinPlugin : IMixinConfigPlugin {
         myTargets: Set<String>,
         otherTargets: Set<String>
     ) {
+        if (FabricLoader.getInstance().isDevelopmentEnvironment) {
+            return
+        }
+
         val mappings = MemoryMappingTree()
 
         try {
