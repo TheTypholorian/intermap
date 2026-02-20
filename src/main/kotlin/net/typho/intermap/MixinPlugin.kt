@@ -1,23 +1,24 @@
 package net.typho.intermap
 
 import com.chocohead.mm.api.ClassTinkerers
-import com.llamalad7.mixinextras.utils.MixinInternals
+import com.google.common.collect.Queues
 import kotlinx.io.files.FileNotFoundException
 import net.fabricmc.loader.api.FabricLoader
-import net.fabricmc.loader.api.metadata.CustomValue
 import net.fabricmc.loader.impl.lib.mappingio.MappingReader
 import net.fabricmc.loader.impl.lib.mappingio.format.MappingFormat
 import net.fabricmc.loader.impl.lib.mappingio.format.tiny.Tiny1FileReader
 import net.fabricmc.loader.impl.lib.mappingio.format.tiny.Tiny2FileReader
+import net.fabricmc.loader.impl.lib.mappingio.tree.MappingTreeView
 import net.fabricmc.loader.impl.lib.mappingio.tree.MemoryMappingTree
 import net.fabricmc.loader.impl.util.mappings.FilteringMappingVisitor
+import net.fabricmc.loader.impl.util.mappings.MixinIntermediaryDevRemapper
+import net.fabricmc.loader.impl.util.mappings.MixinRemapper
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.commons.ClassRemapper
 import org.objectweb.asm.commons.Remapper
 import org.objectweb.asm.tree.ClassNode
 import org.spongepowered.asm.mixin.MixinEnvironment
-import org.spongepowered.asm.mixin.extensibility.IMixinConfig
 import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin
 import org.spongepowered.asm.mixin.extensibility.IMixinInfo
 import org.spongepowered.asm.mixin.transformer.ClassInfo
@@ -35,6 +36,35 @@ import kotlin.io.path.outputStream
 
 class MixinPlugin : IMixinConfigPlugin {
     companion object {
+        @JvmField
+        val mappings: MemoryMappingTree?
+
+        init {
+            if (FabricLoader.getInstance().isDevelopmentEnvironment) {
+                mappings = null
+            } else {
+                mappings = MemoryMappingTree()
+
+                try {
+                    val stream = getMappingsStream()
+
+                    BufferedReader(InputStreamReader(stream)).use { reader ->
+                        val filter = FilteringMappingVisitor(mappings)
+                        reader.mark(4096)
+                        val format = MappingReader.detectFormat(reader)
+                        reader.reset()
+                        when (format) {
+                            MappingFormat.TINY_FILE -> Tiny1FileReader.read(reader, filter)
+                            MappingFormat.TINY_2_FILE -> Tiny2FileReader.read(reader, filter)
+                            else -> throw UnsupportedOperationException("Unsupported mapping format: $format")
+                        }
+                    }
+                } catch (e: IOException) {
+                    throw RuntimeException(e)
+                }
+            }
+        }
+
         @JvmStatic
         fun getMappingsStream(
             version: String = FabricLoader
@@ -68,6 +98,18 @@ class MixinPlugin : IMixinConfigPlugin {
     }
 
     override fun onLoad(mixinPackage: String) {
+        if (mappings != null) {
+            MixinEnvironment.getDefaultEnvironment().remappers.add(object : MixinRemapper(
+                mappings,
+                mappings.getNamespaceId("named"),
+                mappings.getNamespaceId(FabricLoader.getInstance().mappingResolver.currentRuntimeNamespace)
+            ) {
+                override fun map(typeName: String?): String? {
+                    println("map $typeName")
+                    return super.map(typeName)
+                }
+            })
+        }
     }
 
     override fun getRefMapperConfig(): String? {
@@ -82,32 +124,17 @@ class MixinPlugin : IMixinConfigPlugin {
         myTargets: Set<String>,
         otherTargets: Set<String>
     ) {
-        if (FabricLoader.getInstance().isDevelopmentEnvironment) {
+        if (mappings == null) {
             return
         }
 
-        val mappings = MemoryMappingTree()
-
-        try {
-            val stream = getMappingsStream()
-
-            BufferedReader(InputStreamReader(stream)).use { reader ->
-                val filter = FilteringMappingVisitor(mappings)
-                reader.mark(4096)
-                val format = MappingReader.detectFormat(reader)
-                reader.reset()
-                when (format) {
-                    MappingFormat.TINY_FILE -> Tiny1FileReader.read(reader, filter)
-                    MappingFormat.TINY_2_FILE -> Tiny2FileReader.read(reader, filter)
-                    else -> throw UnsupportedOperationException("Unsupported mapping format: $format")
-                }
-            }
-        } catch (e: IOException) {
-            throw RuntimeException(e)
-        }
-
-        val target = mappings.getNamespaceId(FabricLoader.getInstance().mappingResolver.currentRuntimeNamespace);
+        val target = mappings.getNamespaceId(FabricLoader.getInstance().mappingResolver.currentRuntimeNamespace)
         val named = mappings.getNamespaceId("named")
+        val classMappingsCache = HashMap<String, MappingTreeView.ClassMappingView?>()
+
+        fun lookupClass(name: String): MappingTreeView.ClassMappingView? {
+            return classMappingsCache.computeIfAbsent(name) { key -> mappings.getClass(key, named) ?: mappings.getClass(key, target) }
+        }
 
         for (mod in FabricLoader.getInstance().allMods) {
             mod.metadata.customValues["intermap"]?.asObject?.let { settings ->
@@ -132,7 +159,25 @@ class MixinPlugin : IMixinConfigPlugin {
                                                     name: String,
                                                     descriptor: String
                                                 ): String {
-                                                    return mappings.getMethod(owner, name, descriptor, named)?.getName(target) ?: name
+                                                    val queue = Queues.newArrayDeque<String>(listOf(owner))
+
+                                                    while (!queue.isEmpty()) {
+                                                        val og = queue.poll()
+                                                        val cls = lookupClass(aliases.getOrDefault(og, og)) ?: continue
+
+                                                        val method = cls.getMethod(name, descriptor, named)?.getName(target)
+
+                                                        if (method != null) {
+                                                            return method
+                                                        }
+
+                                                        ClassInfo.forName(cls.getName(target) ?: og)?.let { info ->
+                                                            info.superClass?.let { queue.add(it.name) }
+                                                            queue.addAll(info.interfaces)
+                                                        }
+                                                    }
+
+                                                    return name
                                                 }
 
                                                 override fun mapFieldName(
@@ -140,11 +185,29 @@ class MixinPlugin : IMixinConfigPlugin {
                                                     name: String,
                                                     descriptor: String
                                                 ): String {
-                                                    return mappings.getField(owner, name, descriptor, named)?.getName(target) ?: name
+                                                    val queue = Queues.newArrayDeque<String>(listOf(owner))
+
+                                                    while (!queue.isEmpty()) {
+                                                        val og = queue.poll()
+                                                        val cls = lookupClass(aliases.getOrDefault(og, og)) ?: continue
+
+                                                        val field = cls.getField(name, descriptor, named)?.getName(target)
+
+                                                        if (field != null) {
+                                                            return field
+                                                        }
+
+                                                        ClassInfo.forName(cls.getName(target) ?: og)?.let { info ->
+                                                            info.superClass?.let { queue.add(it.name) }
+                                                            queue.addAll(info.interfaces)
+                                                        }
+                                                    }
+
+                                                    return name
                                                 }
 
                                                 override fun map(internalName: String): String? {
-                                                    return mappings.mapClassName(aliases.getOrDefault(internalName, internalName), named, target)
+                                                    return lookupClass(aliases.getOrDefault(internalName, internalName))?.getName(target)
                                                 }
                                             })
                                             node.accept(remapper)
